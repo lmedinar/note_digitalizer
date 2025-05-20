@@ -2,6 +2,9 @@
 
 import sys
 import os
+import io
+import pytesseract
+from PIL import Image
 from PyQt5.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -20,8 +23,17 @@ from PyQt5.QtWidgets import (
     QGroupBox,
     QFrame,
 )
-from PyQt5.QtCore import Qt, QRect, QPoint
-from PyQt5.QtGui import QPixmap, QPainter, QPen, QColor, QImage
+from PyQt5.QtCore import Qt, QRect, QPoint, QBuffer, QEvent
+from PyQt5.QtGui import (
+    QPixmap,
+    QPainter,
+    QPen,
+    QColor,
+    QImage,
+    QClipboard,
+    QTransform,
+    QKeySequence,
+)
 
 
 class DigitizerApp(QMainWindow):
@@ -36,8 +48,94 @@ class DigitizerApp(QMainWindow):
         self.scale_factor = 1.0
         self.loaded_pixmap = None
         self.crop_pixmap = None
+        self.setAcceptDrops(True)
+        self.installEventFilter(self)
+
+    def eventFilter(self, obj, event):
+        # Detectar Ctrl+V global
+        if event.type() == QEvent.KeyPress and event.matches(QKeySequence.Paste):
+            clipboard = QApplication.clipboard()
+            # Si hay imagen en el clipboard, cargarla
+            if clipboard.mimeData().hasImage():
+                img = clipboard.image()
+                # convertir QImage a QPixmap
+                pix = QPixmap.fromImage(img)
+                self.load_image(pix)
+                return True  # consumido
+        return super().eventFilter(obj, event)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            for url in event.mimeData().urls():
+                if url.isLocalFile():
+                    ext = os.path.splitext(url.toLocalFile())[1].lower()
+                    if ext in (".png", ".jpg", ".jpeg"):
+                        event.acceptProposedAction()
+                        return
+        event.ignore()
+
+    def dropEvent(self, event):
+        if not event.mimeData().hasUrls():
+            return
+        # Tomamos solo la primera
+        file_path = event.mimeData().urls()[0].toLocalFile()
+        ext = os.path.splitext(file_path)[1].lower()
+        if ext in (".png", ".jpg", ".jpeg"):
+            self.load_image(file_path)
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def load_image(self, source):
+        """
+        source: o bien un path (str) o un QPixmap
+        """
+        if isinstance(source, str):
+            pix = QPixmap(source)
+        else:
+            pix = source
+        if pix.isNull():
+            return
+        self.loaded_pixmap = pix
+        self.document_view.set_pixmap(pix)
+        self.auto_adjust_zoom()
+        self.recognized_text.clear()
+        self.crop_pixmap = None
+        self.crop_preview.clear()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.update_crop_preview()
+
+    def update_crop_preview(self):
+        if self.crop_pixmap:
+            scaled = self.crop_pixmap.scaled(
+                self.crop_preview.size(),
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation,
+            )
+            self.crop_preview.setPixmap(scaled)
+
+    def export_image(self):
+        if self.crop_pixmap:
+            file_path, _ = QFileDialog.getSaveFileName(
+                self, "Guardar imagen", "", "Imágenes PNG (*.png)"
+            )
+            if file_path:
+                self.crop_pixmap.save(file_path, "PNG")
+
+    def copy_to_clipboard(self):
+        if self.crop_pixmap:
+            clipboard = QApplication.clipboard()
+            clipboard.setPixmap(self.crop_pixmap, QClipboard.Clipboard)
 
     def initUI(self):
+        # En lugar de añadir directamente mode_box al left_layout,
+        # creamos un layout horizontal que contendrá:
+        #  ┌───────────────┐ ┌───────────────┐
+        #  │ mode_box      │ │ rotate_box    │
+        #  └───────────────┘ └───────────────┘
+
         self.setWindowTitle("Digitalizador de Apuntes Universitarios")
         self.setGeometry(100, 100, 1200, 800)
 
@@ -59,6 +157,7 @@ class DigitizerApp(QMainWindow):
         self.open_button.clicked.connect(self.open_file)
         left_layout.addWidget(self.open_button)
 
+        # ——— 1) Agrupación de los radio buttons ———
         # Radio buttons para seleccionar modalidad
         mode_box = QGroupBox("Modo de selección")
         mode_layout = QVBoxLayout()
@@ -81,12 +180,29 @@ class DigitizerApp(QMainWindow):
         mode_layout.addWidget(self.equation_hand_radio)
         mode_layout.addWidget(self.image_radio)
 
+        mode_box.setLayout(mode_layout)
+
         self.mode_group.addButton(self.move_radio)
         self.mode_group.addButton(self.text_book_radio)
         self.mode_group.addButton(self.equation_book_radio)
         self.mode_group.addButton(self.text_hand_radio)
         self.mode_group.addButton(self.equation_hand_radio)
         self.mode_group.addButton(self.image_radio)
+
+        # ——— 2) Botones de rotación en un layout vertical ———
+        rotate_box = QGroupBox("Rotar imagen")
+        rotate_layout = QVBoxLayout()
+
+        self.rotate_right_btn = QPushButton("⟳")
+        self.rotate_left_btn = QPushButton("⟲")
+        rotate_layout.addWidget(self.rotate_right_btn)
+        rotate_layout.addWidget(self.rotate_left_btn)
+
+        rotate_box.setLayout(rotate_layout)
+
+        # Conectar señales
+        self.rotate_right_btn.clicked.connect(lambda: self.rotate_image(90))
+        self.rotate_left_btn.clicked.connect(lambda: self.rotate_image(-90))
 
         # Conectar radio buttons a cambio de modo
         self.move_radio.toggled.connect(lambda: self.change_mode("Mover"))
@@ -100,8 +216,14 @@ class DigitizerApp(QMainWindow):
         )
         self.image_radio.toggled.connect(lambda: self.change_mode("Imagen"))
 
-        mode_box.setLayout(mode_layout)
-        left_layout.addWidget(mode_box)
+        # mode_box.setLayout(mode_layout)
+        # left_layout.addWidget(mode_box)
+
+        controls_layout = QHBoxLayout()
+        controls_layout.addWidget(mode_box)
+        controls_layout.addWidget(rotate_box)
+        # Finalmente lo agregamos al left_layout
+        left_layout.addLayout(controls_layout)
 
         # Área de visualización de documento
         scroll_area = QScrollArea()
@@ -140,6 +262,24 @@ class DigitizerApp(QMainWindow):
         self.crop_preview.setFrameShape(QFrame.Box)
 
         preview_layout.addWidget(self.crop_preview)
+
+        # Crear layout horizontal para los botones
+        button_layout = QHBoxLayout()
+        # Botón de exportar imagen
+        self.export_button = QPushButton("Exportar imagen...")
+        self.export_button.clicked.connect(self.export_image)
+        button_layout.addWidget(self.export_button)
+
+        # Botón de copiar al portapapeles
+        self.copy_button = QPushButton("Copiar al clipboard")
+        self.copy_button.clicked.connect(self.copy_to_clipboard)
+        button_layout.addWidget(self.copy_button)
+
+        # Añadir layout de botones al layout del preview
+        preview_layout.addLayout(button_layout)
+
+        preview_box.setLayout(preview_layout)
+
         preview_box.setLayout(preview_layout)
         right_layout.addWidget(preview_box)
 
@@ -153,6 +293,11 @@ class DigitizerApp(QMainWindow):
         text_box.setLayout(text_layout)
         right_layout.addWidget(text_box)
 
+        right_splitter = QSplitter(Qt.Vertical)
+        right_splitter.addWidget(preview_box)
+        right_splitter.addWidget(text_box)
+        right_layout.addWidget(right_splitter)
+
         # Añadir ambos paneles al splitter
         splitter.addWidget(left_panel)
         splitter.addWidget(right_panel)
@@ -160,7 +305,7 @@ class DigitizerApp(QMainWindow):
 
     def open_file(self):
         file_path, _ = QFileDialog.getOpenFileName(
-            self, "Abrir archivo", "", "Archivos (*.pdf *.png *.jpg *.jpeg)"
+            self, "Abrir archivo", "", "Archivos (*.png *.jpg *.jpeg)"
         )
 
         if file_path:
@@ -174,10 +319,10 @@ class DigitizerApp(QMainWindow):
                 # Mejor ajustar zoom automáticamente para ver la imagen completa
                 self.auto_adjust_zoom()
 
-            elif file_path.lower().endswith(".pdf"):
+            else:
                 # Aquí se implementaría la carga de PDF
                 # Por ahora mostraremos un mensaje
-                self.recognized_text.setText("Carga de PDF aún no implementada.")
+                self.recognized_text.sexteto("Formato no soportado...")
 
     def auto_adjust_zoom(self):
         if not self.loaded_pixmap:
@@ -203,6 +348,20 @@ class DigitizerApp(QMainWindow):
 
         # Centrar la imagen
         self.document_view.center_image()
+
+    def rotate_image(self, angle):
+        """Gira la imagen cargada y reajusta el zoom."""
+        if not self.loaded_pixmap:
+            return
+
+        transform = QTransform().rotate(angle)
+        # rotar pixmap
+        self.loaded_pixmap = self.loaded_pixmap.transformed(
+            transform, Qt.SmoothTransformation
+        )
+        # actualizar vista y zoom
+        self.document_view.set_pixmap(self.loaded_pixmap)
+        self.auto_adjust_zoom()
 
     def change_mode(self, mode):
         self.current_mode = mode
@@ -233,32 +392,57 @@ class DigitizerApp(QMainWindow):
 
             if not adjusted_rect.isEmpty():
                 self.crop_pixmap = self.loaded_pixmap.copy(adjusted_rect)
-                self.crop_preview.setPixmap(
-                    self.crop_pixmap.scaled(
-                        self.crop_preview.width(),
-                        self.crop_preview.height(),
-                        Qt.KeepAspectRatio,
-                        Qt.SmoothTransformation,
-                    )
-                )
+                self.update_crop_preview()
 
                 # Aquí se implementaría el reconocimiento según el modo seleccionado
                 self.recognize_content(self.current_mode)
 
     def recognize_content(self, mode):
-        """
-        Función provisional para simular el reconocimiento según el modo.
-        En una implementación real, aquí se llamaría a las APIs de OCR correspondientes.
-        """
-        mode_text = {
-            "Texto de libro": "Se reconocería texto impreso aquí...",
-            "Ecuación de libro": "Se reconocería una ecuación impresa aquí...",
-            "Texto a mano": "Se reconocería texto manuscrito aquí...",
-            "Ecuación a mano": "Se reconocería una ecuación manuscrita aquí...",
-            "Imagen": "Imagen seleccionada para guardar.",
-        }
+        # Si es texto de libro, hacemos OCR con Tesseract
+        if mode == "Texto de libro" and self.crop_pixmap:
+            # 1) Convertir QPixmap → bytes PNG en memoria
+            buffer = QBuffer()
+            buffer.open(QBuffer.ReadWrite)
+            self.crop_pixmap.save(buffer, "PNG")
+            data = buffer.data()
+            buffer.close()
 
-        self.recognized_text.setText(f"Modo: {mode}\n\n{mode_text.get(mode, '')}")
+            # 2) Leer bytes con PIL
+            pil_img = Image.open(io.BytesIO(data))
+
+            # 3) Llamar a pytesseract
+            #    Ajusta 'lang' y 'config' si quieres mejorar precisión
+            text = pytesseract.image_to_string(
+                pil_img,
+                lang="spa",  # español
+                config="--oem 1 --psm 6",  # LSTM + segmento por bloque de texto
+            )
+
+            ###################################################
+            # # DEBUG: mostrar formato crudo en terminal      #
+            # print("=== OCR RAW TEXT BEGIN ===")             #
+            # print(repr(text))                               #
+            # print("=== OCR RAW TEXT END ===\n")             #
+            # # también puedes imprimir líneas numeradas:     #
+            # for i, line in enumerate(text.splitlines(), 1): #
+            #     print(f"{i:03d}> {repr(line)}")             #
+            # print("--- end of lines ---")                   #
+            ###################################################
+
+            # 4) Mostrar en el QTextEdit
+            self.recognized_text.setPlainText(text.strip())
+        else:
+            # Comportamiento para los otros modos (imagen, ecuación, etc.)
+            mode_text = {
+                "Texto de libro": "",  # ya manejado arriba
+                "Ecuación de libro": "Se reconocería una ecuación impresa aquí...",
+                "Texto a mano": "Se reconocería texto manuscrito aquí...",
+                "Ecuación a mano": "Se reconocería una ecuación manuscrita aquí...",
+                "Imagen": "Imagen seleccionada para guardar.",
+            }
+            self.recognized_text.setPlainText(
+                f"Modo: {mode}\n\n{mode_text.get(medo,'')}"
+            )
 
 
 class DocumentViewer(QWidget):
